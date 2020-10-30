@@ -1,6 +1,6 @@
 # GLOFsusceptibility
 
-This repository contains the source code, as well as the two needed data sets to run it, to estimate susceptibility of Hindu-Kush Karakoram Himalaya (HKKH) glacier lakes to GLOFs in the past four decades. The code describes four Bayesian multi-level logistic regressions, in which we encoded and test the potential influences of characteristics such as glacier lake area and its dynamics, catchment area, regional glacier-mass balances and monsoonality on a given lake's GLOF history. The script, which is deposited as a commented Rmarkdown-file, has to be run in R (https://www.r-project.org/) and RStudio (https://rstudio.com). Data compiled in the two data sets is freely available from following sources: 
+This repository contains the source code, as well as the two needed data sets to run it, to estimate susceptibility of Hindu-Kush Karakoram Himalaya (HKKH) glacier lakes to GLOFs in the past four decades. The code describes four Bayesian multi-level logistic regression models, in which we encode and test the possible influences of glacier lake area and its dynamics, catchment area, regional glacier-mass balances, and monsoonality on a given lake's GLOF history. The script, which is deposited as a commented Rmarkdown-file, has to be run in R (https://www.r-project.org/) and RStudio (https://rstudio.com). Data compiled in the two data sets are freely available from: 
 
 - Shuttle Radar Topography Mission (SRTM) from the US Geological Survey (https://www.earthexplorer.usgs.gov) 
 - CHELSA Bioclim data set (https://chelsa-climate.org/bioclim/): Karger, D. N., Conrad, O., Böhner, J., Kawohl, T., Kreft, H., Soria-Auza, R. W., Zimmermann, N. E., Linder, H. P. and Kessler, M.: Climatologies at high resolution for the earth’s land surface areas, Sci. Data, 4, 1–20, doi:10.1038/sdata.2017.122, 2017. 
@@ -24,7 +24,7 @@ This data set has to be loaded into the script included in BMR_GLOFs_HKKH.Rmd. T
 
 ## References
 
-Fischer, M., Korup, O., Veh, G. and Walz, A.: Controls of outburst of Himalayan moraine-dammed lakes. The Cryosphere (submitted).
+Fischer, M., Korup, O., Veh, G., and A. Walz: Controls of outburst of Himalayan moraine-dammed lakes. The Cryosphere (submitted).
 
 ## Contact
 
