@@ -1,4 +1,4 @@
-#GLOFsusceptibility
+# GLOFsusceptibility
 
 This repository contains the source code, as well as the two needed data sets to run it, to estimate susceptibility of Hindu-Kush Karakoram Himalaya (HKKH) glacier lakes to GLOFs in the past four decades. The code describes four Bayesian multi-level logistic regressions, in which we encoded and test the potential influences of characteristics such as glacier lake area and its dynamics, catchment area, regional glacier-mass balances and monsoonality on a given lake's GLOF history. The script, which is deposited as a commented Rmarkdown-file, has to be run in R (https://www.r-project.org/) and RStudio (https://rstudio.com). Data compiled in the two data sets is freely available from following sources: 
 
