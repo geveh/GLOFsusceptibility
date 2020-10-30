@@ -1,0 +1,807 @@
+---
+title: "Controls of outburst of Himalayan moraine-dammed lakes"
+author: "Melanie Fischer, Oliver Korup, Georg Veh, and Ariane Walz"
+date: "30 10 2020"
+output: 
+  html_document: 
+    toc: true
+    toc-depth: 4
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Rationale
+We use Bayesian multi-level logistic regression to obtain the posterior probability that a given lake in the Hindu-Kush Karakoram Himalaya (HKKH) had released a glacial lake outburst flood (GLOF) in the past four decades.
+
+## Preparations
+```{r message=FALSE, warning=FALSE}
+# Remove any previous output
+graphics.off()
+rm(list = ls(all = TRUE))
+
+# Set working directory
+setwd("~/LogRegAllParameter")
+
+# Load libraries
+library(brms)
+library(rstan)
+library(ggridges)
+library(tidybayes)
+library(dplyr)
+library(ggplot2)
+library(cowplot)
+library(magrittr)
+library(stringr)
+library(bayestestR)
+
+# Set prelims for STAN
+# Select multiple cores as suggested
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+```
+
+## Load and groom data
+We start off by loading, merging, and cleaning our two main datasets of HKKH glacier lakes. They include the timing (years) of known GLOF events, as well as topographic, climatic, and glacier-mass balance data derived from lake inventories (Maharjan et al., 2018; Veh et al., 2019; Wang et al., 2020), the SRTM DEM, CHELSA data (Karger et al., 2014), and Brun et al.'s (2017) analysis.  
+```{r}
+# Load and merge two main datasets
+raw <- read.csv("GLOF_HKH_Sep2020_2.csv", header = TRUE)
+
+timed <- read.table("GLOFDataAll_Dates_GLIMS.txt")
+
+dat <- merge(raw, timed, by.x = "GLIMS_I", by.y = "GLIMS_ID") # Identification of lakes by their GLIMS-IDs
+dat$region[1544] <- "Central Himalaya"
+```
+
+### Specify predictors
+Based on this dataset, we process and compute some potential predictors. This step includes the standardisation of continuous variables.
+```{r}
+# Standardise predictors: 
+# Lake area
+dat$area <- as.numeric(scale(log10(dat$Area.x)))
+
+# Lake areas in 1990, 2005, and 2018
+dat$A1990 <- ifelse(dat$area1990 > 0, dat$area1990, NA)
+dat$A2005 <- ifelse(dat$area2005 > 0, dat$area2005, NA)
+dat$A2018 <- ifelse(dat$area2018 > 0, dat$area2018, NA)
+
+dat$dA28 <- as.numeric(scale(log10(dat$A2018 / dat$A1990)))
+dat$dA15 <- as.numeric(scale(log10(dat$A2005 / dat$A1990)))
+dat$dA13 <- as.numeric(scale(log10(dat$A2018 / dat$A2005)))
+
+dat$growth28 <- ifelse(abs(log10(dat$A2018 / dat$A1990)) > 0.1, 1, 0)
+dat$growth15 <- ifelse(abs(log10(dat$A2005 / dat$A1990)) > 0.1, 1, 0)
+dat$growth13 <- ifelse(abs(log10(dat$A2018 / dat$A2005)) > 0.1, 1, 0)
+
+# Lake elevation
+dat$zmin <- as.numeric(scale(dat$Z_min))
+
+# Catchment area
+dat$ctc <- as.numeric(scale(log10(dat$catchm_ar)))
+
+# Summer precipitation
+dat$sumrprecip <- as.numeric(scale(dat$bio18_lake))
+
+# Summer precipitation as a function of annual precipitation
+dat$sumrprecipfrc <- as.numeric(scale(dat$bio18_lake / dat$bio12_lake))
+```
+
+### Specify groups 
+We further consider a number of groups that might add structure to the data. These groups (or levels) include:
+```{r}
+# Elevation quantile classes
+dat$elevclass <- cut(dat$Z_min, quantile(dat$Z_min, (0:5) / 5, na.rm = TRUE))
+levels(dat$elevclass) <- c("Lowest",
+                           "Low",
+                           "Medium", 
+                           "High",
+                           "Highest")
+
+# Fraction of summer precipitation classes
+dat$SPF <- cut(dat$sumrprecipfrc, quantile(dat$sumrprecipfrc, (0:4) / 4), na.rm = TRUE)
+levels(dat$SPF) <- c("Less than half",
+                     "Two third",
+                     "ca. 70%",
+                     ">70%")
+
+# Wet season precipitation
+dat$SmmrPrZ <- as.factor(dat$SmmrPrZ)
+levels(dat$SmmrPrZ) <- c("Dry", "Moderately Dry", "Moderately Wet", "Wet")
+```
+
+We also obtain the timing of each GLOF to be able to assign them to a given observation interval:
+```{r}
+# Assign GLOFs to time slice by outburst date
+dat$Period <- ifelse(dat$Date < 1990, -1,
+                     ifelse(dat$Date >= 1990 & dat$Date < 2005, 0, 1))
+levels(dat$Period) <- c("Before 1990", "1990 to 2005", "2005 to 2018")
+```
+
+## Set up STAN models
+### Elevation-dependent warming model
+The first model we consider addresses elevation-dependent warming (EDW) and uses elevation quintiles as levels in the data. We choose a multivariate regression model in which the intercept varies across elevation levels. We use as predictors lake area and a dummy variable indicating whether or not the lake grew or shrank between 1990 and 2018.
+```{r}
+# Collect complete cases for candidate variables
+mod_dat_edw <- dat[complete.cases(cbind(dat$GLOF.x,
+                                        dat$area,
+                                        dat$growth28,
+                                        dat$elevclass)), ]
+
+# Set prior probabilities
+mypriors_edw <- c(
+  prior(student_t(3, 0, 2.5), class = "Intercept"),   # Robust intercept
+  prior(student_t(3, 0, 2.5), class = "b", coef = "growth28"),  # Robust population-level effects
+  prior(normal(1, 1), class = "b", coef = "area"), # custom Gaussian for lake area
+  prior(exponential(1), class = "sd")  # sd of intercept across groups
+)
+
+# Specify EDW model
+fit_edw <- brm(GLOF.x ~ area + growth28 + (1 | elevclass),
+               data = mod_dat_edw,
+               family = bernoulli(link = "logit"),
+               warmup = 500,
+               iter = 5500,
+               prior = mypriors_edw,
+               control = list(adapt_delta = 0.99),
+               chains = 4, cores = 4)
+   
+```
+
+We check several model sampling diagnostics, starting with the modelling results for group-level and population-level effects (Notice that a seed has to be specified when setting up the model with the brm()-function if exactly reproducable model output values are needed. Otherwise slight deviations might occur due to divergent sampling): 
+```{r}
+# Model results 
+summary(fit_edw)
+```
+
+We ensure that our model has Rhat values <1.01. 
+```{r}
+# Rhat values
+plot(rhat(fit_edw)); abline(h = 1.01, lty = 2, col = "red")
+```
+
+We also check the predictive posteriors using the readily included pp_check functionality. 
+```{r}
+# Predictive posterior check
+brms::pp_check(fit_edw, nsamples = 100)
+```
+
+Finally, we check predictive capabilities with the leave-one-out cross-validation (LOO-cv) metric expected log predictive density (ELPD):
+```{r}
+# LOO-cv
+loo(fit_edw)
+```
+
+After successful checks we then derive the population- and group-level effects:
+```{r}
+# Population effects
+(fix_edw <- brms::fixef(fit_edw))
+
+# Group effects
+(ran_edw <- brms::ranef(fit_edw))
+```
+
+We plot the conditional effects of our indicator variable net lake change (*delta A*) on GLOF history *P(GLOF)* given a certain (standardised) lake area and dependent on the elevation group-levels: 
+```{r}
+# Plot per elevation-level
+conditions_edw <- data.frame(elevclass = sort(unique(dat$elevclass)))
+rownames(conditions_edw) <- sort(unique(dat$elevclass))
+
+conde_edw <- conditional_effects(fit_edw,
+                             conditions = conditions_edw,
+                             #method = "posterior_predict", # posterior predictive
+                             re_formula = NULL,  # Include random effects
+                             effects = "area:growth28"
+                             )
+
+plot(conde_edw, ncol = 5, points = TRUE, plot = FALSE)[[1]] + 
+  scale_color_manual(values = c("purple", "darkgrey", "orange")) +
+  scale_fill_manual(values = c("purple", "darkgrey", "orange")) +
+  labs(x = "Standardised lake area", y = "P(GLOF)", 
+       colour = expression(paste(Delta, "A")), 
+       fill = expression(paste(Delta, "A"))) + 
+  theme_bw()
+```
+
+We further check how the intercept varies across elevation levels:
+```{r}
+# Extract sample draws from STAN posterior object
+(post_pars_edw <- get_variables(fit_edw))
+
+# Select variable to plot and collect in list of arguments to tidybayes::spread_draws()
+mylist_edw <- list(fit_edw, as.name(post_pars_edw[1]))
+
+# Obtain population-level parameter
+pooled_edw <- do.call(spread_draws, mylist_edw)
+pooled_edw <- pooled_edw %>% 
+  mutate(elevclass = "Pooled", 
+         param = NA, 
+         r_elevclass = NA, 
+         elevclass_mean = b_Intercept)
+
+# Bind population- with group-level parameters and plot summed contributions
+mod_edw <- fit_edw %>%
+  spread_draws(b_Intercept, r_elevclass[elevclass, param]) %>%
+  mutate(elevclass_mean = b_Intercept + r_elevclass) %>%
+  bind_rows(pooled_edw) %>%
+  ungroup() %>%
+  mutate(group = reorder(elevclass, elevclass_mean)) %>%
+  ggplot(aes(x = elevclass_mean,
+             relevel(group, "Pooled", after = Inf))) +
+  coord_cartesian(xlim = c(-7, -4)) + 
+  geom_vline(xintercept = 0, color = "red") + 
+  geom_vline(xintercept = fixef(fit_edw)[1, 1], color = "grey") + 
+  stat_halfeye(interval_size = 1, 
+               shape = 21,
+               point_color = "red",
+               point_fill = "white",
+               point_size = 1.5,
+               slab_fill = "darkgrey",
+               slab_alpha = 0.75) + 
+  geom_vline(xintercept = fixef(fit_edw)[1, 3:4], color = "grey",
+             linetype = "dashed") +
+  labs(title = "EDW",
+       x = paste("Standardised intercept"), y = "Elevation") + 
+  theme_ggdist()
+
+mod_edw
+```
+
+Finally, we compare the predicted posterior probabilities of a historic GLOF for each lake with the prior probabilities that we estimate from the relative frequency of GLOFs in the training data. We express what we have learned in terms of the log-odds ratio. A positive (negative) log-odds ratio means that we obtained a higher (lower) posterior probability of attributing a historic GLOF to a given lake compared to a random draw.
+```{r}
+# Mean posterior predictions
+mu_pred_edw <- predict(fit_edw)
+
+# Plot posterior estimates compared to naive prior frequency estimate
+frq_estimate_edw <- sum(mod_dat_edw$GLOF.x == 1) / nrow(mu_pred_edw)
+noglof_estimate_edw <- sum(mod_dat_edw$GLOF.x == 0) / nrow(mu_pred_edw)
+
+# Extract predictions for lakes with GLOF history
+# True positives
+logodds_tp_edw <- log(mu_pred_edw[mod_dat_edw$GLOF.x == 1, 1] / 
+                    (1 - mu_pred_edw[mod_dat_edw$GLOF.x == 1, 1]) / 
+                    (frq_estimate_edw / (1 - frq_estimate_edw)))
+
+# Two-panel plot
+par(mfcol = c(1, 2))
+
+barplot(sort(logodds_tp_edw), 
+        col = "gold", border = NA, las = 1,
+        xlab = paste0(round((sum(logodds_tp_edw > 0) / length(logodds_tp_edw)) * 100),
+          "% TP"), ylab = "Log odds ratio", 
+        cex.lab = 1.2,
+        main = "EDW")
+abline(h = seq(-10, 10, 1), col = "grey", lty = 2)
+
+# True negatives
+# Catch infinite values arising from zero division
+logodds_tn_edw <- log((1 - mu_pred_edw[mod_dat_edw$GLOF.x == 0, 1]) / 
+              mu_pred_edw[mod_dat_edw$GLOF.x == 0, 1] / 
+              (noglof_estimate_edw / (1 - noglof_estimate_edw)))
+logodds_tn_edw <- logodds_tn_edw[!is.infinite(logodds_tn_edw)]
+
+barplot(sort(logodds_tn_edw), 
+        col = "cornflowerblue", border = NA, las = 1,
+        xlab = paste0(round((sum(logodds_tn_edw > 0) / length(logodds_tn_edw)) * 100),
+                      "% TN"), 
+        ylab = "Log odds ratio", 
+        cex.lab = 1.2,
+        main = "EDW")
+abline(h = seq(-10, 10, 1), col = "grey", lty = 2)
+```
+
+### Forecasting model
+We can expand our first model by explicitly taking into account changes in lake area before reported GLOFs happened. We can use this approach to fore- or hindcast historic GLOFs. Here we use relative change rates between 1990 and 2005 and see how well these work as predictors for GLOFs that happened between 2005 and 2018. We also include an interaction term to account for potential interaction between lake area (in 2005) and lake area change rates: 
+```{r}
+# Lakes from 1990 to 2005 only
+dat <- dat[!is.na(dat$dA15), ]
+
+# GLOFs from 2005 to 2018 only
+dat <- dat[-which(dat$Period < 1), ]
+
+# Collect complete cases for candidate variables
+mod_dat_tmp <- dat[complete.cases(cbind(dat$GLOF.x,
+                                        dat$area,
+                                        dat$dA15,
+                                        dat$elevclass)), ]
+
+# Set prior probabilities
+mypriors_tmp <- c(
+  prior(student_t(3, 0, 2.5), class = "Intercept"),   # Robust intercept
+  prior(normal(1, 1), class = "b", coef = "area"), # custom Gaussian for lake area
+  prior(exponential(1), class = "sd")  # sd of intercept across groups
+)
+
+# Specify forecasting model
+fit_tmp <- brm(GLOF.x ~ area + dA15 + area:dA15 + (1 | elevclass),
+               data = mod_dat_tmp,
+               family = bernoulli(link = "logit"),
+               warmup = 500,
+               iter = 5500,
+               prior = mypriors_tmp,
+               control = list(adapt_delta = 0.99),
+               chains = 4, cores = 4)
+```
+
+We again check several diagnostics, starting with a look at the model outputs: 
+```{r}
+summary(fit_tmp)
+```
+
+The Rhat values: 
+```{r}
+# Rhat values
+plot(rhat(fit_tmp)); abline(h = 1.01, lty = 2, col = "red")
+```
+
+The predictive posteriors: 
+```{r}
+# Predictive posterior check
+brms::pp_check(fit_tmp, nsamples = 100)
+```
+
+And the LOO-cv metrics: 
+```{r}
+# LOO-cv
+loo(fit_tmp)
+```
+
+We again derive the population- and group-level effects:
+```{r}
+# Population effects
+(fix_tmp <- brms::fixef(fit_tmp))
+
+# Group effects
+(ran_tmp <- brms::ranef(fit_tmp))
+```
+
+We again plot the conditional effects per elevation level: 
+```{r}
+# Plot per level
+conditions <- data.frame(elevclass = sort(unique(dat$elevclass)))
+rownames(conditions) <- sort(unique(dat$elevclass))
+
+conde_tmp <- conditional_effects(fit_tmp,
+                             conditions = conditions,
+                             #method = "posterior_predict", # posterior predictive
+                             re_formula = NULL,  # Include random effects
+                             effects = "area:dA15"
+                             )
+
+plot(conde_tmp, ncol = 5, points = TRUE, plot = FALSE)[[1]] + 
+  scale_color_manual(values = c("purple", "darkgrey", "orange")) +
+  scale_fill_manual(values = c("purple", "darkgrey", "orange")) +
+  labs(x = "Standardised lake area", y = "P(GLOF)", 
+       colour = expression(paste(Delta, "A")), 
+       fill = expression(paste(Delta, "A"))) + 
+  theme_bw()
+
+```
+
+And check how the intercept varies with elevation levels:
+```{r}
+# Extract sample draws from STAN posterior object
+(post_pars_tmp <- get_variables(fit_tmp))
+
+# Select variable to plot and collect in list of arguments to tidybayes::spread_draws()
+mylist_tmp <- list(fit_tmp, as.name(post_pars_tmp[1]))
+
+# Obtain population-level parameter
+pooled_tmp <- do.call(spread_draws, mylist_tmp)
+pooled_tmp <- pooled_tmp %>% 
+  mutate(elevclass = "Pooled", 
+         param = NA, 
+         r_elevclass = NA, 
+         elevclass_mean = b_Intercept)
+
+# Bind population- with group-level parameters and plot summed contributions
+mod_tmp <- fit_tmp %>%
+  spread_draws(b_Intercept, r_elevclass[elevclass, param]) %>%
+  mutate(elevclass_mean = b_Intercept + r_elevclass) %>%
+  bind_rows(pooled_tmp) %>%
+  ungroup() %>%
+  mutate(group = reorder(elevclass, elevclass_mean)) %>%
+  ggplot(aes(x = elevclass_mean,
+             relevel(group, "Pooled", after = Inf))) +
+  coord_cartesian(xlim = c(-8, -4)) + 
+  geom_vline(xintercept = 0, color = "red") + 
+  geom_vline(xintercept = fixef(fit_tmp)[1, 1], color = "grey") + 
+  stat_halfeye(interval_size = 1, 
+               shape = 21,
+               point_color = "red",
+               point_fill = "white",
+               point_size = 1.5,
+               slab_fill = "darkgrey",
+               slab_alpha = 0.75) + 
+  geom_vline(xintercept = fixef(fit_tmp)[1, 3:4], color = "grey",
+             linetype = "dashed") +
+  labs(title = "Forecasting",
+       x = paste("Standardised intercept"), y = "Elevation") + 
+  theme_ggdist()
+
+mod_tmp
+```
+
+We plot again what we have learned from this model with respect to the prior probabilities:
+```{r}
+# Mean posterior predictions
+mu_pred_tmp <- predict(fit_tmp)
+
+# Plot posterior estimates compared to naive prior frequency estimate
+frq_estimate_tmp <- sum(mod_dat_tmp$GLOF.x == 1) / nrow(mu_pred_tmp)
+noglof_estimate_tmp <- sum(mod_dat_tmp$GLOF.x == 0) / nrow(mu_pred_tmp)
+
+# Extract predictions for lakes with GLOF history
+# True positives
+logodds_tp_tmp <- log(mu_pred_tmp[mod_dat_tmp$GLOF.x == 1, 1] / 
+                    (1 - mu_pred_tmp[mod_dat_tmp$GLOF.x == 1, 1]) / 
+                    (frq_estimate_tmp / (1 - frq_estimate_tmp)))
+
+# Two-panel plot
+par(mfcol = c(1, 2))
+
+barplot(sort(logodds_tp_tmp), 
+        col = "gold", border = NA, las = 1,
+        xlab = paste0(round((sum(logodds_tp_tmp > 0) / length(logodds_tp_tmp)) * 100),
+          "% TP"), ylab = "Log odds ratio", 
+        cex.lab = 1.2,
+        main = "Forecasting")
+abline(h = seq(-10, 10, 1), col = "grey", lty = 2)
+
+# True negatives
+# Catch infinite values arising from zero division
+logodds_tn_tmp <- log((1 - mu_pred_tmp[mod_dat_tmp$GLOF.x == 0, 1]) / 
+              mu_pred_tmp[mod_dat_tmp$GLOF.x == 0, 1] / 
+              (noglof_estimate_tmp / (1 - noglof_estimate_tmp)))
+logodds_tn_tmp <- logodds_tn_tmp[!is.infinite(logodds_tn_tmp)]
+
+barplot(sort(logodds_tn_tmp), 
+        col = "cornflowerblue", border = NA, las = 1,
+        xlab = paste0(round((sum(logodds_tn_tmp > 0) / length(logodds_tn_tmp)) * 100),
+                      "% TN"), 
+        ylab = "Log odds ratio", 
+        cex.lab = 1.2,
+        main = "Forecasting")
+abline(h = seq(-10, 10, 1), col = "grey", lty = 2)
+```
+
+### Glacier-mass balance model
+The third model we consider takes into account the regional averages of glacier mass balances during the early 21st century as described by Brun et al. (2017). We use catchment area, the relative change rate of lake areas from 2005 to 2018, and the average glacier mass balance in a model whose intercept varies by region:
+
+```{r}
+# Collect complete cases for candidate variables
+mod_dat_glm <- dat[complete.cases(cbind(dat$GLOF.x,
+                                        dat$ctc,
+                                        dat$dA13,
+                                        dat$mb_mean,
+                                        dat$elevclass,
+                                        dat$region)), ]
+
+# Set prior probabilties
+mypriors_glm <- c(
+  prior(student_t(3, 0, 2.5), class = "Intercept"),   # robust intercept
+  prior(student_t(3, 0, 2.5), class = "b"), # robust weights
+  prior(exponential(1), class = "sd")  # sd of intercept across groups
+)
+
+# Specify glacier-mass balance model
+fit_glm <- brm(GLOF.x ~ ctc + dA13 + mb_mean + (1  | region) + (1  | elevclass),
+               data = mod_dat_glm,
+               family = bernoulli(link = "logit"),
+               warmup = 500,
+               iter = 5500,
+               prior = mypriors_glm,
+               control = list(adapt_delta = 0.99),
+               chains = 4, cores = 4)
+```
+
+We summarise the model as follows:
+```{r}
+summary(fit_glm)
+```
+
+And make the following checks: 
+```{r}
+# Rhat values
+plot(rhat(fit_glm)); abline(h = 1.01, lty = 2, col = "red")
+```
+
+```{r}
+# Predictive posterior check
+brms::pp_check(fit_glm, nsamples = 100)
+```
+
+```{r}
+# LOO-cv
+loo(fit_glm)
+```
+
+We extract the population- and group-level effects:
+```{r}
+# Population effects
+(fix_glm <- brms::fixef(fit_glm))
+
+# Group effects
+(ran_glm <- brms::ranef(fit_glm))
+```
+
+We then check the posterior probabilities for each region as conditioned by net lake area change:
+```{r}
+# Plot per level
+conditions <- data.frame(region = sort(unique(dat$region)))
+rownames(conditions) <- sort(unique(dat$region))
+
+conde_glm <- conditional_effects(fit_glm,
+                             conditions = conditions,
+                             #method = "posterior_predict", # posterior predictive
+                             re_formula = NULL,  # Include random effects
+                             effects = "ctc:dA13"
+                             )
+
+plot(conde_glm, ncol = 4, points = TRUE, plot = FALSE)[[1]] + 
+  scale_color_manual(values = c("purple", "darkgrey", "orange")) +
+  scale_fill_manual(values = c("purple", "darkgrey", "orange")) +
+  labs(x = "Standardised catchment area", y = "P(GLOF)", 
+       colour = expression(paste(Delta, "A")), 
+       fill = expression(paste(Delta, "A"))) + 
+  theme_bw()
+```
+
+We also check the variation of model intercepts across the glacier-mass balance regions:
+```{r}
+# Extract sample draws from STAN posterior object
+(post_pars_glm <- get_variables(fit_glm))
+
+# Select variable to plot and collect in list of arguments to tidybayes::spread_draws()
+mylist_glm <- list(fit_glm, as.name(post_pars_glm[1]))
+
+# Obtain population-level parameter
+pooled_glm <- do.call(spread_draws, mylist_glm)
+pooled_glm <- pooled_glm %>% 
+  mutate(region = "Pooled", 
+         param = NA, 
+         r_region = NA, 
+         region_mean = b_Intercept)
+
+# Bind population- with group-level parameters and plot summed contributions
+mod_glm <- fit_glm %>%
+  spread_draws(b_Intercept, r_region[region, param]) %>%
+  mutate(region_mean = b_Intercept + r_region) %>%
+  bind_rows(pooled_glm) %>%
+  ungroup() %>%
+  mutate(region = str_replace_all(region, "[.]", " ")) %>%
+  mutate(group = reorder(region, region_mean)) %>%
+  ggplot(aes(x = region_mean,
+             relevel(group, "Pooled", after = Inf))) +
+  coord_cartesian(xlim = c(-12, -4)) + 
+  geom_vline(xintercept = 0, color = "red") + 
+  geom_vline(xintercept = fixef(fit_glm)[1, 1], color = "grey") + 
+  stat_halfeye(interval_size = 1, 
+               shape = 21,
+               point_color = "red",
+               point_fill = "white",
+               point_size = 1.5,
+               slab_fill = "darkgrey",
+               slab_alpha = 0.75) + 
+  geom_vline(xintercept = fixef(fit_glm)[1, 3:4], color = "grey",
+             linetype = "dashed") +
+  labs(title = "Glacier-mass balance",
+       x = paste("Standardised intercept"), y = "Region") + 
+  theme_ggdist()
+
+mod_glm
+```
+
+This is what we have learned with respect to the prior probabilities of finding a lake with a GLOF history by chance:
+```{r}
+# Mean posterior predictions
+mu_pred_glm <- predict(fit_glm)
+
+# Plot posterior estimates compared to naive prior frequency estimate
+frq_estimate_glm <- sum(mod_dat_glm$GLOF.x == 1) / nrow(mu_pred_glm)
+noglof_estimate_glm <- sum(mod_dat_glm$GLOF.x == 0) / nrow(mu_pred_glm)
+
+# Extract predictions for lakes with GLOF history
+# True positives
+logodds_tp_glm <- log(mu_pred_glm[mod_dat_glm$GLOF.x == 1, 1] / 
+                    (1 - mu_pred_glm[mod_dat_glm$GLOF.x == 1, 1]) / 
+                    (frq_estimate_glm / (1 - frq_estimate_glm)))
+
+# Two-panel plot
+par(mfcol = c(1, 2))
+
+barplot(sort(logodds_tp_glm), 
+        col = "gold", border = NA, las = 1,
+        xlab = paste0(round((sum(logodds_tp_glm > 0) / length(logodds_tp_glm)) * 100),
+          "% TP"), ylab = "Log odds ratio", 
+        cex.lab = 1.2,
+        main = "Glacier-mass balance")
+abline(h = seq(-10, 10, 1), col = "grey", lty = 2)
+
+# True negatives
+# Catch infinite values arising from zero division
+logodds_tn_glm <- log((1 - mu_pred_glm[mod_dat_glm$GLOF.x == 0, 1]) / 
+              mu_pred_glm[mod_dat_glm$GLOF.x == 0, 1] / 
+              (noglof_estimate_glm / (1 - noglof_estimate_glm)))
+logodds_tn_glm <- logodds_tn_glm[!is.infinite(logodds_tn_glm)]
+
+barplot(sort(logodds_tn_glm), 
+        col = "cornflowerblue", border = NA, las = 1,
+        xlab = paste0(round((sum(logodds_tn_glm > 0) / length(logodds_tn_glm)) * 100),
+                      "% TN"), 
+        ylab = "Log odds ratio", 
+        cex.lab = 1.2,
+        main = "Glacier-mass balance")
+abline(h = seq(-10, 10, 1), col = "grey", lty = 2)
+```
+
+### Monsoonality model
+The final model that we consider groups the data according to the quantiles of the annual proportions of summer precipitation that we interpret as a measure of monsoonality. In addition to that, we use the glacier-mass balance regions as additional group level as well the catchment area and the changes in lake area between 1990 and 2018 as predictors in this varying-intercept model:
+```{r}
+# Collect complete cases for candidate variables
+mod_dat_mon <- dat[complete.cases(cbind(dat$GLOF.x,
+                                        dat$ctc,
+                                        dat$dA28,
+                                        dat$SPF,
+                                        dat$elevclass,
+                                        dat$region)), ]
+
+# Set prior probabilities
+mypriors_mon <- c(
+  prior(student_t(3, 0, 2.5), class = "Intercept"),   # Robust intercept
+  prior(student_t(3, 0, 2.5), class = "b"),
+  prior(exponential(1), class = "sd")  # sd of intercept across groups
+)
+
+# Specify the monsoonality model
+fit_mon <- brm(GLOF.x ~ ctc + dA28 + (1 | SPF) + (1 | region),
+               data = mod_dat_mon,
+               family = bernoulli(link = "logit"),
+               warmup = 500,
+               iter = 5500,
+               prior = mypriors_mon,
+               control = list(adapt_delta = 0.99),
+               chains = 4, cores = 4)
+```
+
+We summarise the model output:
+```{r}
+summary(fit_mon)
+```
+
+And the sampling performance:
+```{r}
+# Rhat values
+plot(rhat(fit_mon)); abline(h = 1.01, lty = 2, col = "red")
+```
+
+```{r}
+# Predictive posterior check
+brms::pp_check(fit_mon, nsamples = 100)
+```
+
+```{r}
+# LOO-cv
+loo(fit_mon)
+```
+
+We also extract the population- and group-level effects: 
+```{r}
+# Population effects
+(fix_mon <- brms::fixef(fit_mon))
+
+# Group effects
+(ran_mon <- brms::ranef(fit_mon))
+```
+
+Like before, we plot the posterior probabilities of *P(GLOF)*, this time for the four different monsoonality levels:
+```{r}
+# Plot per level
+conditions <- data.frame(SPF = sort(unique(dat$SPF)))
+rownames(conditions) <- sort(unique(dat$SPF))
+
+conde_mon <- conditional_effects(fit_mon,
+                             conditions = conditions,
+                             #method = "posterior_predict", # posterior predictive
+                             re_formula = NULL,  # Include random effects
+                             effects = "ctc:dA28"
+                             )
+
+plot(conde_mon, ncol = 2, points = TRUE, plot = FALSE)[[1]] + 
+  scale_color_manual(values = c("purple", "darkgrey", "orange")) +
+  scale_fill_manual(values = c("purple", "darkgrey", "orange")) +
+  labs(x = "Standardised catchment area", y = "P(GLOF)", 
+       colour = expression(paste(Delta, "A")), 
+       fill = expression(paste(Delta, "A"))) + 
+  theme_bw()
+```
+
+The intercept varies across these levels of monsoonality as follows: 
+```{r}
+# Extract sample draws from STAN posterior object
+(post_pars_mon <- get_variables(fit_mon))
+
+# Select variable to plot and collect in list of arguments to tidybayes::spread_draws()
+mylist_mon <- list(fit_mon, as.name(post_pars_mon[1]))
+
+# Obtain population-level parameter
+pooled_mon <- do.call(spread_draws, mylist_mon)
+pooled_mon <- pooled_mon %>% 
+  mutate(SPF = "Pooled", 
+         param = NA, 
+         r_SPF = NA, 
+         SPF_mean = b_Intercept)
+
+# Bind population- with group-level parameters and plot summed contributions
+mod_mon <- fit_mon %>%
+  spread_draws(b_Intercept, r_SPF[SPF, param]) %>%
+  mutate(SPF_mean = b_Intercept + r_SPF) %>%
+  bind_rows(pooled_mon) %>%
+  ungroup() %>%
+  mutate(SPF = str_replace_all(SPF, "[.]", " ")) %>%
+  mutate(group = reorder(SPF, SPF_mean)) %>%
+  ggplot(aes(x = SPF_mean,
+             relevel(group, "Pooled", after = Inf))) +
+  coord_cartesian(xlim = c(-8, -4)) + 
+  geom_vline(xintercept = 0, color = "red") + 
+  geom_vline(xintercept = fixef(fit_mon)[1, 1], color = "grey") + 
+  stat_halfeye(interval_size = 1, 
+               shape = 21,
+               point_color = "red",
+               point_fill = "white",
+               point_size = 1.5,
+               slab_fill = "darkgrey",
+               slab_alpha = 0.75) + 
+  geom_vline(xintercept = fixef(fit_mon)[1, 3:4], color = "grey",
+             linetype = "dashed") +
+  labs(title = "Monsoonality",
+       x = paste("Standardised intercept"), y = "Monsoonality") + 
+  theme_ggdist()
+
+mod_mon
+```
+
+Finally, we summarise what we have learned compared to our prior knowledge:
+```{r}
+# Mean posterior predictions
+mu_pred_mon <- predict(fit_mon)
+
+# Plot posterior estimates compared to naive prior frequency estimate
+frq_estimate_mon <- sum(mod_dat_mon$GLOF.x == 1) / nrow(mu_pred_mon)
+noglof_estimate_mon <- sum(mod_dat_mon$GLOF.x == 0) / nrow(mu_pred_mon)
+
+# Extract predictions for lakes with GLOF history
+# True positives
+logodds_tp_mon <- log(mu_pred_mon[mod_dat_mon$GLOF.x == 1, 1] / 
+                    (1 - mu_pred_mon[mod_dat_mon$GLOF.x == 1, 1]) / 
+                    (frq_estimate_mon / (1 - frq_estimate_mon)))
+
+# Two-panel plot
+par(mfcol = c(1, 2))
+
+barplot(sort(logodds_tp_mon), 
+        col = "gold", border = NA, las = 1,
+        xlab = paste0(round((sum(logodds_tp_mon > 0) / length(logodds_tp_mon)) * 100),
+          "% TP"), ylab = "Log odds ratio", 
+        cex.lab = 1.2,
+        main = "Monsoonality")
+abline(h = seq(-10, 10, 1), col = "grey", lty = 2)
+
+# True negatives
+# Catch infinite values arising from zero division
+logodds_tn_mon <- log((1 - mu_pred_mon[mod_dat_mon$GLOF.x == 0, 1]) / 
+              mu_pred_mon[mod_dat_mon$GLOF.x == 0, 1] / 
+              (noglof_estimate_mon / (1 - noglof_estimate_mon)))
+logodds_tn_mon <- logodds_tn_mon[!is.infinite(logodds_tn_mon)]
+
+barplot(sort(logodds_tn_mon), 
+        col = "cornflowerblue", border = NA, las = 1,
+        xlab = paste0(round((sum(logodds_tn_mon > 0) / length(logodds_tn_mon)) * 100),
+                      "% TN"), 
+        ylab = "Log odds ratio", 
+        cex.lab = 1.2,
+        main = "Monsoonality")
+abline(h = seq(-10, 10, 1), col = "grey", lty = 2)
+```
+
+
